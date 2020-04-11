@@ -3,13 +3,18 @@ package web
 import (
 	"bytes"
 	"context"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"html/template"
 	"log"
 	"net/http"
+	"net/url"
 	"time"
 
+	"github.com/crewjam/saml/samlsp"
 	"github.com/spf13/viper"
 
 	"github.com/kellegous/go/backend"
@@ -90,6 +95,10 @@ func getLinks(backend backend.Backend, w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func hello(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintf(w, "Hello, %s!", samlsp.AttributeFromContext(r.Context(), "cn"))
+}
+
 // ListenAndServe sets up all web routes, binds the port and handles incoming
 // web requests.
 func ListenAndServe(backend backend.Backend) error {
@@ -97,18 +106,56 @@ func ListenAndServe(backend backend.Backend) error {
 	admin := viper.GetBool("admin")
 	version := viper.GetString("version")
 
+	keyPair, err := tls.LoadX509KeyPair("myservice.cert", "myservice.key")
+	if err != nil {
+		panic(err) // TODO handle error
+	}
+	keyPair.Leaf, err = x509.ParseCertificate(keyPair.Certificate[0])
+	if err != nil {
+		panic(err) // TODO handle error
+	}
+
+	rootURL, _ := url.Parse("http://localhost:8067")
+	idpMetadataURL, _ := url.Parse("https://samltest.id/saml/idp")
+
+	idpMetadata, err := samlsp.FetchMetadata(
+		context.Background(),
+		http.DefaultClient,
+		*idpMetadataURL)
+	if err != nil {
+		panic(err) // TODO handle error
+	}
+
+	samlSP, err := samlsp.New(samlsp.Options{
+		URL:         *rootURL,
+		IDPMetadata: idpMetadata,
+		Key:         keyPair.PrivateKey.(*rsa.PrivateKey),
+		Certificate: keyPair.Leaf,
+	})
+
+	if err != nil {
+		panic(err) // TODO handle error
+	}
+
+	app := http.HandlerFunc(hello)
+	//http.Handle("/hello", app)
+	//http.Handle("/saml/", samlSP)
+
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/api/url/", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/hello", samlSP.RequireAccount(app))
+	mux.Handle("/saml/", samlSP)
+
+	mux.Handle("/api/url/", samlSP.RequireAccount(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		apiURL(backend, w, r)
-	})
-	mux.HandleFunc("/api/urls/", func(w http.ResponseWriter, r *http.Request) {
+	})))
+	mux.Handle("/api/urls/", samlSP.RequireAccount(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		apiURLs(backend, w, r)
-	})
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		getDefault(backend, w, r)
-	})
-	mux.HandleFunc("/edit/", func(w http.ResponseWriter, r *http.Request) {
+	})))
+	//mux.Handle("/", samlSP.RequireAccount(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	//	getDefault(backend, w, r)
+	//})))
+	mux.Handle("/edit/", samlSP.RequireAccount(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := parseName("/edit/", r.URL.Path)
 
 		// if this is a banned name, just redirect to the local URI. That'll show em.
@@ -118,19 +165,19 @@ func ListenAndServe(backend backend.Backend) error {
 		}
 
 		serveAsset(w, r, "edit.html")
-	})
-	mux.HandleFunc("/links/", func(w http.ResponseWriter, r *http.Request) {
+	})))
+	mux.Handle("/links/", samlSP.RequireAccount(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		getLinks(backend, w, r)
-	})
-	mux.HandleFunc("/s/", func(w http.ResponseWriter, r *http.Request) {
+	})))
+	mux.Handle("/s/", samlSP.RequireAccount(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		serveAsset(w, r, r.URL.Path[len("/s/"):])
-	})
-	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
+	})))
+	mux.Handle("/version", samlSP.RequireAccount(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, version)
-	})
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	})))
+	mux.Handle("/healthz", samlSP.RequireAccount(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, "👍")
-	})
+	})))
 
 	// TODO(knorton): Remove the admin handler.
 	if admin {
